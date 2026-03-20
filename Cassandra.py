@@ -53,14 +53,22 @@ def insert_group_data(session, data, group, insert_stmt):
 
 def aggregation_query(session, group):
     start = time.perf_counter()
-    result = session.execute(f"""
-        SELECT SUM(value) AS total_value
-        FROM {TABLE}
-        WHERE group_name = %s
-    """, (group,))
+    count_result = session.execute(
+        f"SELECT COUNT(*) AS total_count FROM {TABLE} WHERE group_name = %s",
+        (group,)
+    )
+    sum_result = session.execute(
+        f"SELECT SUM(value) AS total_value FROM {TABLE} WHERE group_name = %s",
+        (group,)
+    )
     elapsed = time.perf_counter() - start
-    row = result.one()
-    return elapsed, row.total_value if row else None
+    count_row = count_result.one()
+    sum_row = sum_result.one()
+    if not count_row and not sum_row:
+        return elapsed, None, 0
+    total_count = count_row.total_count if count_row else 0
+    total_value = sum_row.total_value if sum_row else None
+    return elapsed, total_value, total_count
 
 
 def truncate_table(session):
@@ -99,6 +107,10 @@ def measure_workload(session, groups, workload_type, sample_size):
             action = "read" if random.random() < 0.5 else "write"
         elif workload_type == "aggregation":
             action = "aggregation"
+        elif workload_type == "aggregation-count":
+            action = "aggregation-count"
+        elif workload_type == "aggregation-sum":
+            action = "aggregation-sum"
         else:
             raise ValueError("Invalid workload type")
 
@@ -117,9 +129,30 @@ def measure_workload(session, groups, workload_type, sample_size):
             start = time.perf_counter()
             session.execute(insert_stmt, (payload["group_name"], payload["id"], payload["value"]))
             elapsed = time.perf_counter() - start
-        else:  # aggregation
+        elif action == "aggregation-count":
             start = time.perf_counter()
-            _ = session.execute(f"SELECT SUM(value) AS total_value FROM {TABLE} WHERE group_name = %s", (group,)).one()
+            _ = session.execute(
+                f"SELECT COUNT(*) AS total_count FROM {TABLE} WHERE group_name = %s",
+                (group,)
+            ).one()
+            elapsed = time.perf_counter() - start
+        elif action == "aggregation-sum":
+            start = time.perf_counter()
+            _ = session.execute(
+                f"SELECT SUM(value) AS total_value FROM {TABLE} WHERE group_name = %s",
+                (group,)
+            ).one()
+            elapsed = time.perf_counter() - start
+        else:  # aggregation (count then sum)
+            start = time.perf_counter()
+            _ = session.execute(
+                f"SELECT COUNT(*) AS total_count FROM {TABLE} WHERE group_name = %s",
+                (group,)
+            ).one()
+            _ = session.execute(
+                f"SELECT SUM(value) AS total_value FROM {TABLE} WHERE group_name = %s",
+                (group,)
+            ).one()
             elapsed = time.perf_counter() - start
 
         latencies.append(elapsed)
@@ -182,7 +215,11 @@ def human_ms(seconds):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Cassandra performance measurement")
     parser.add_argument("--data-file", default="data.json", help="JSON file with data")
-    parser.add_argument("--workload", choices=["read-heavy", "write-heavy", "balanced", "aggregation"], default="balanced")
+    parser.add_argument(
+        "--workload",
+        choices=["read-heavy", "write-heavy", "balanced", "aggregation", "aggregation-count", "aggregation-sum"],
+        default="balanced"
+    )
     parser.add_argument("--sample-size", type=int, default=1000, help="Number of operations to simulate per workload")
     parser.add_argument("--clear-table", action="store_true", help="Truncate the table before running")
     parser.add_argument("--no-populate", action="store_true", help="Skip initial base data population")
@@ -268,7 +305,10 @@ if __name__ == "__main__":
 
     # run one final aggregation per group
     for group in groups:
-        agg_time, total_val = aggregation_query(session, group)
-        print(f"Aggregation group {group}: time={agg_time:.4f}s total_value={total_val}")
+        agg_time, total_val, total_count = aggregation_query(session, group)
+        print(
+            f"Aggregation group {group}: "
+            f"time={agg_time:.4f}s total_count={total_count} total_value={total_val}"
+        )
 
     cluster.shutdown()

@@ -3,6 +3,8 @@ import json
 import argparse
 import random
 import statistics
+import subprocess
+from collections import defaultdict
 from cassandra.cluster import Cluster
 
 try:
@@ -61,17 +63,32 @@ def aggregation_query(session, group):
     return elapsed, row.total_value if row else None
 
 
+def truncate_table(session):
+    session.execute(f"TRUNCATE {TABLE}")
+
+
+def invalidate_cassandra_caches():
+    """Best-effort invalidation of Cassandra key/row caches via nodetool."""
+    for cmd in (("nodetool", "invalidatekeycache"), ("nodetool", "invalidaterowcache")):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                stderr = result.stderr.strip() or "unknown error"
+                print(f"Warning: {' '.join(cmd)} failed: {stderr}")
+        except FileNotFoundError:
+            print("Warning: nodetool not found; Cassandra caches were not invalidated")
+            return
+
+
 def measure_workload(session, groups, workload_type, sample_size):
     latencies = []
     ops = 0
+    per_group_latencies = defaultdict(list)
+    per_group_ops = defaultdict(int)
     insert_stmt = session.prepare(f"""
         INSERT INTO {TABLE} (group_name, id, value)
         VALUES (?, ?, ?)
     """)
-
-    # Pre-warm by ensuring data exists for each group
-    for group in groups:
-        _, _ = insert_group_data(session, data, group, insert_stmt)
 
     for i in range(sample_size):
         if workload_type == "read-heavy":
@@ -106,9 +123,43 @@ def measure_workload(session, groups, workload_type, sample_size):
             elapsed = time.perf_counter() - start
 
         latencies.append(elapsed)
+        per_group_latencies[group].append(elapsed)
+        per_group_ops[group] += 1
         ops += 1
 
-    return latencies, ops
+    total_latency_s = sum(latencies)
+    per_group_metrics = {}
+    for group in groups:
+        group_latencies = per_group_latencies[group]
+        group_ops = per_group_ops[group]
+        if not group_latencies:
+            per_group_metrics[group] = {
+                "ops": 0,
+                "avg_latency_ms": 0.0,
+                "p95_latency_ms": 0.0,
+                "p99_latency_ms": 0.0,
+                "throughput_ops_s": 0.0,
+                "ops_utilization_pct": 0.0,
+                "time_utilization_pct": 0.0,
+            }
+            continue
+
+        group_total_latency_s = sum(group_latencies)
+        group_avg = statistics.mean(group_latencies)
+        group_p95 = statistics.quantiles(group_latencies, n=100)[94] if len(group_latencies) >= 100 else max(group_latencies)
+        group_p99 = statistics.quantiles(group_latencies, n=100)[98] if len(group_latencies) >= 100 else max(group_latencies)
+
+        per_group_metrics[group] = {
+            "ops": group_ops,
+            "avg_latency_ms": human_ms(group_avg),
+            "p95_latency_ms": human_ms(group_p95),
+            "p99_latency_ms": human_ms(group_p99),
+            "throughput_ops_s": (group_ops / group_total_latency_s) if group_total_latency_s > 0 else 0.0,
+            "ops_utilization_pct": (group_ops / ops * 100) if ops > 0 else 0.0,
+            "time_utilization_pct": (group_total_latency_s / total_latency_s * 100) if total_latency_s > 0 else 0.0,
+        }
+
+    return latencies, ops, per_group_metrics
 
 
 def resource_snapshot():
@@ -133,6 +184,13 @@ if __name__ == "__main__":
     parser.add_argument("--data-file", default="data.json", help="JSON file with data")
     parser.add_argument("--workload", choices=["read-heavy", "write-heavy", "balanced", "aggregation"], default="balanced")
     parser.add_argument("--sample-size", type=int, default=1000, help="Number of operations to simulate per workload")
+    parser.add_argument("--clear-table", action="store_true", help="Truncate the table before running")
+    parser.add_argument("--no-populate", action="store_true", help="Skip initial base data population")
+    parser.add_argument(
+        "--cold-start",
+        action="store_true",
+        help="Force cold-start style run: truncate table and invalidate Cassandra key/row caches before workload",
+    )
     args = parser.parse_args()
 
     # Connect
@@ -140,25 +198,36 @@ if __name__ == "__main__":
     session = cluster.connect()
 
     setup_schema(session)
-    data = read_data(args.data_file)
+
+    if args.clear_table or args.cold_start:
+        print("Clearing table before run ...")
+        truncate_table(session)
 
     groups = ["A", "B", "C"]
-
-    print("Populating base data for groups A/B/C ...")
-    insert_stmt = session.prepare(f"""
-        INSERT INTO {TABLE} (group_name, id, value)
-        VALUES (?, ?, ?)
-    """)
-
     group_stats = {}
-    for group in groups:
-        elapsed, count = insert_group_data(session, data, group, insert_stmt)
-        group_stats[group] = {"insert_time_s": elapsed, "row_count": count}
-        print(f"Group {group}: inserted {count} rows in {elapsed:.4f}s")
+
+    if args.no_populate:
+        print("Skipping base population (--no-populate enabled) ...")
+    else:
+        data = read_data(args.data_file)
+        print("Populating base data for groups A/B/C ...")
+        insert_stmt = session.prepare(f"""
+            INSERT INTO {TABLE} (group_name, id, value)
+            VALUES (?, ?, ?)
+        """)
+
+        for group in groups:
+            elapsed, count = insert_group_data(session, data, group, insert_stmt)
+            group_stats[group] = {"insert_time_s": elapsed, "row_count": count}
+            print(f"Group {group}: inserted {count} rows in {elapsed:.4f}s")
+
+    if args.cold_start:
+        print("Invalidating Cassandra key/row caches before workload ...")
+        invalidate_cassandra_caches()
 
     print("Running workload measurement...")
     before_res = resource_snapshot()
-    latencies, total_ops = measure_workload(session, groups, args.workload, args.sample_size)
+    latencies, total_ops, per_group_metrics = measure_workload(session, groups, args.workload, args.sample_size)
     after_res = resource_snapshot()
 
     avg_lat = statistics.mean(latencies)
@@ -179,6 +248,19 @@ if __name__ == "__main__":
         print(f"CPU percent (snapshot after): {after_res['cpu_percent']}%")
         print(f"Memory percent (after): {after_res['mem_percent']}%")
         print(f"Disk read bytes + write bytes diff: {(after_res['disk_read_bytes'] - before_res['disk_read_bytes']) + (after_res['disk_write_bytes'] - before_res['disk_write_bytes'])}")
+
+    print("\n=== WORKLOAD BY GROUP ===")
+    for g in groups:
+        m = per_group_metrics[g]
+        print(
+            f"Group {g}: ops={m['ops']} "
+            f"avg={m['avg_latency_ms']:.3f}ms "
+            f"p95={m['p95_latency_ms']:.3f}ms "
+            f"p99={m['p99_latency_ms']:.3f}ms "
+            f"throughput={m['throughput_ops_s']:.2f} ops/s "
+            f"ops_util={m['ops_utilization_pct']:.2f}% "
+            f"time_util={m['time_utilization_pct']:.2f}%"
+        )
 
     print("\n=== GROUP SUMMARY ===")
     for g, stats in group_stats.items():

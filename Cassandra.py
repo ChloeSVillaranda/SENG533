@@ -213,6 +213,7 @@ def human_ms(seconds):
 
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(description="Cassandra performance measurement")
     parser.add_argument("--data-file", default="data.json", help="JSON file with data")
     parser.add_argument(
@@ -228,10 +229,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Force cold-start style run: truncate table and invalidate Cassandra key/row caches before workload",
     )
+    parser.add_argument(
+        "--contact-points",
+        nargs='+',
+        default=["127.0.0.1"],
+        help="List of Cassandra node IPs/hostnames (space-separated). E.g. --contact-points 127.0.0.1 127.0.0.2 127.0.0.3"
+    )
     args = parser.parse_args()
 
     # Connect
-    cluster = Cluster(["127.0.0.1"])
+    cluster = Cluster(args.contact_points)
     session = cluster.connect()
 
     setup_schema(session)
